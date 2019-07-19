@@ -5,11 +5,12 @@ A sample script to create cost report usage per instance type
 """
 
 import argparse
-import boto3
 import datetime
 import operator
 import prettytable
 import time
+import collections
+import re
 
 import matplotlib.pyplot as plt
 from matplotlib import colors
@@ -18,6 +19,15 @@ from boto.ec2.instance import Instance
 from boto.ec2.ec2object import TaggedEC2Object
 import config
 from boto.exception import EC2ResponseError
+
+_CLOUD_DEV_MACHINE = 'cloud_dev_machine'
+
+def strip(x): return x.replace('\n','').strip() if x else ''
+
+
+InstanceMetadata = collections.namedtuple('InstanceMetadata', [
+  'id', 'name', 'owner', 'state', 'private_dns', 'public_dns', 'stopped_time'
+])
 
 
 def object_sort_key(obj):
@@ -45,32 +55,6 @@ def object_sort_key(obj):
     fields.insert(2, obj.availability_zone if obj.availability_zone else 'unknown')
 
   return fields
-
-def create_instance_details_table(instances):
-  """
-  Create a PrettyTable of the most commonly useful instance details.
-
-  :param instances: A list of instances to generate from
-  :return: A PrettyTable object
-  """
-  # TODO(ltd): Move to utils
-  table = prettytable.PrettyTable(['ID', 'Role', 'Hostname', 'State', 'Instance Type',
-                                   'Launch date'], sortby='Role', reversesort=True,
-                                  sort_key=operator.itemgetter(2, 6))
-
-  table.align['ID'] = 'l'
-  table.align['Role'] = 'l'
-  table.align['Hostname'] = 'r'
-  table.padding_width = 2
-
-  for instance in instances:
-    role = generate_role(instance)
-    host = generate_host(instance)
-    table.add_row([instance.id, role if role else 'unknown', host if host else 'unknown',
-                   instance.state, instance.instance_type, instance.launch_time[:10]])
-
-  return table
-
 
 def generate_role(obj):
   """
@@ -112,26 +96,25 @@ def generate_host(obj, prepend_user=False, use_ip=False, user=None):
 
   # TODO(ltd): Move to utils
 
-  if not isinstance(obj, (Instance,)):
-    return None
-
   host_user = user or ''
+  tags = obj.get('Tags', [])
+  tags = { i['Key'] : i['Value'] for i in tags }
   if prepend_user:
-    if user is None and config.INSTANCE_USER_KEY in obj.tags:
-      user = obj.tags[config.INSTANCE_USER_KEY]
+    if user is None and config.INSTANCE_OWNER_KEY in tags:
+      user = tags.get(config.INSTANCE_OWNER_KEY, '')
     if user is not None:
-      host_user = user + '@'
+      host_user = user + ':'
 
   environment = ''
-  if config.INSTANCE_ENVIRONMENT_KEY in obj.tags:
-    environment = obj.tags[config.INSTANCE_ENVIRONMENT_KEY] + '-'
+  if config.INSTANCE_ENVIRONMENT_KEY in tags:
+    environment = tags.get(config.INSTANCE_ENVIRONMENT_KEY, '') + '-'
 
   purpose = ''
-  if config.INSTANCE_PURPOSE_KEY in obj.tags:
-    purpose = obj.tags[config.INSTANCE_PURPOSE_KEY] + '-'
+  if config.INSTANCE_PURPOSE_KEY in tags:
+    purpose = tags.get(config.INSTANCE_PURPOSE_KEY, '') + '-'
 
-  ip = obj.private_ip_address
-  identifier = obj.id.split('-')[-1]
+  ip = obj.get('PrivateIpAddress', None)
+  identifier = obj['InstanceId'].split('-')[-1]
 
   if use_ip:
     return '{user}{ip}'.format(
@@ -146,3 +129,84 @@ def generate_host(obj, prepend_user=False, use_ip=False, user=None):
       identifier=identifier,
       subdomain=config.MANAGED_SUBDOMAIN
     )
+
+def create_instance_details_table(instances):
+  """
+  Create a PrettyTable of the most commonly useful instance details.
+
+  :param instances: A list of instances to generate from
+  :return: A PrettyTable object
+  """
+  # TODO(ltd): Move to utils
+  table = prettytable.PrettyTable(['ID', 'Role', 'Hostname', 'State', 'Instance Type',
+                                   'Launch date'], sortby='Role', reversesort=True,
+                                  sort_key=operator.itemgetter(2, 6))
+
+  table.align['ID'] = 'l'
+  table.align['Role'] = 'l'
+  table.align['Hostname'] = 'r'
+  table.padding_width = 2
+
+  for instance in instances:
+    role = generate_role(instance)
+    host = generate_host(instance)
+    table.add_row([instance['InstanceId'], role if role else 'unknown', host if host else 'unknown',
+                   instance['State']['Name'], instance['InstanceType'], instance['LaunchTime']])
+
+  return table
+
+
+def _get_instance_metadata(instances):
+  """
+  Retrieves various metadata for one or more instances.
+
+  :param instances: A list of :py:class:`boto.ec2.instance.Instance` objects
+  :param include_shutdown_time: Whether to retrieve instances' scheduled shutdown times
+  :return: A list of :py:class:`uc.fab.roles.cloud_testing.InstanceMetadata` objects
+  """
+  metadata = {}
+ 
+  # 'id', 'name', 'owner', 'state', 'private_dns', 'public_dns', 'stopped_time'
+  for instance in instances:
+    if instance['State']['Name'] in ('running', 'stopped'):
+      tags = instance.get('Tags', [])
+      tags = {i['Key'] : i['Value'] for i in tags}
+      stop_time = ''
+      if instance['StateTransitionReason'] and instance['State']['Name'] == 'stopped':
+        if '(' in  instance['StateTransitionReason']:
+          stop_time = re.findall('.*\((.*)\)', instance['StateTransitionReason'])[0]
+      metadata[instance['InstanceId']] = InstanceMetadata(
+        instance['InstanceId'],
+        tags.get(_CLOUD_DEV_MACHINE, ''),
+        tags.get(config.INSTANCE_OWNER_KEY, ''),
+        instance['State']['Name'],
+        generate_host(instance),
+        instance['PublicDnsName'],
+        stop_time
+      )
+    else:
+      metadata[instance['InstanceId']] = InstanceMetadata(
+        instance['InstanceId'], tags.get(_CLOUD_DEV_MACHINE),tags.get(config.INSTANCE_OWNER_KEY), instance['State']['Name'], '', '', ''
+      )
+
+  return metadata
+
+def create_instance_detail_file(instances, fname):
+  metadata = _get_instance_metadata(instances)
+  f = open(fname,"w+")
+  f.write('\t'.join(['ID', 'Role', 'Hostname','Environment', 'State', 'Instance Type', 'Launch date', 
+    'Owner', 'Name', 'Stopped Time','Days since Stopped']))
+  for instance in instances:
+    role = generate_role(instance)
+    host = generate_host(instance)
+    _id = instance['InstanceId']
+    env = instance['KeyName']
+    stop_days = 0
+    if metadata[_id].stopped_time:
+      delta = datetime.datetime.utcnow() - datetime.datetime.strptime(metadata[_id].stopped_time, '%Y-%m-%d %H:%M:%S GMT')
+      stop_days = delta.days
+    row = [_id, role if role else 'unknown', host if host else 'unknown', env,
+      metadata[_id].state, instance['InstanceType'], instance['LaunchTime'].strftime('%Y-%m-%d %H:%M:%S GMT')]
+    row.extend([strip(metadata[_id].owner), strip(metadata[_id].name), metadata[_id].stopped_time, str(stop_days)])
+    f.write('\n' + '\t'.join(row))
+  f.close() 
