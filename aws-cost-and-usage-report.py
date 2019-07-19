@@ -8,7 +8,6 @@ import argparse
 import boto3
 import datetime
 import operator
-import prettytable
 import time
 import utils
 
@@ -20,55 +19,54 @@ from boto.ec2.ec2object import TaggedEC2Object
 import config
 from boto.exception import EC2ResponseError
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--days', type=int, default=30)
-args = parser.parse_args()
-
-
-now = datetime.datetime.utcnow()
-start = (now - datetime.timedelta(days=args.days)).strftime('%Y-%m-%d')
-end = now.strftime('%Y-%m-%d')
-
-
 
 def _query_filters(environment=None, purpose=None, user=None, zone=None):
-  filters = {}
+  filters = []
 
   if environment:
-    filters['tag:' + config.INSTANCE_ENVIRONMENT_KEY] = environment
+    filters.append({'Name':'tag:'+config.INSTANCE_ENVIRONMENT_KEY, 'Values':[environment]})
+    # filters['tag:' + config.INSTANCE_ENVIRONMENT_KEY] = environment
   if purpose:
-    filters['tag:' + config.INSTANCE_PURPOSE_KEY] = purpose.replace('_', '-')
+    filters.append({'Name':'tag:'+config.INSTANCE_PURPOSE_KEY, 'Values':[purpose]})
+    # filters['tag:' + config.INSTANCE_PURPOSE_KEY] = purpose.replace('_', '-')
   if user:
-    filters['tag:' + config.INSTANCE_USER_KEY] = user
+    filters.append({'Name':'tag:'+config.INSTANCE_USER_KEY, 'Values':[user]})
+    # filters['tag:' + config.INSTANCE_USER_KEY] = user
   if zone:
-    filters['availabilityZone'] = zone
+    filters.append({'Name':'availabilityZone:', 'Values':[zone]})
+    # filters['availabilityZone'] = zone
 
   return filters
 
 def _instance_query(environment=None, purpose=None, user=None):
+  print("Running instance query")
   filters = _query_filters(environment=environment, purpose=purpose, user=user)
   interval_secs = 5
   checks = 0
   max_timeout = 60
   ran = False
-  objects = None
+  response = None
 
   while not ran and checks * interval_secs < max_timeout:
     try:
-      objects = boto3.client(boto3.connect_ec2).get_only_instances(filters=filters)
+      ec2 = boto3.client('ec2')
+      # if filters:
+      #   response = ec2.describe_instances(Filters=filters)
+      # else:
+      response = ec2.describe_instances()
       ran = True
     except EC2ResponseError as error:
       print(error.error_message)
       time.sleep(interval_secs)
     checks = checks + 1
+  
+  instances = []
+  for reservation in response['Reservations']:
+    instances.extend(reservation['Instances'])
+  return instances
 
-  if objects:
-    objects.sort(key=utils.object_sort_key)
 
-  return objects
-
-
-def instance_query(environment=None, purpose=None, user=None, running=True, raw_output=False):
+def instance_query(environment=None, purpose=None, user=None, running=False, raw_output=False, fname=None):
   """
   Queries AWS for any instances matching the specified parameters.
 
@@ -82,27 +80,28 @@ def instance_query(environment=None, purpose=None, user=None, running=True, raw_
   """
 
   instances = [
-    i for i in _instance_query(environment, purpose, user) if not running or i.state == 'running'
+    i for i in _instance_query(environment, purpose, user) if not running or i['State']['Name'] == 'running'
   ]
-
   
   if not instances:
     print(colors.red('No instances matching specified query.'))
-    if environment:
-      print('\tenvironment = %s' % environment)
-    if purpose:
-      print('\tpurpose = %s' % purpose)
-    if user:
-      print('\tuser = %s' % user)
-    elif raw_output:
-      for instance in instances:
-        print(utils.generate_host(instance))
-    else:
-      print(utils.create_instance_details_table(instances).get_string(sortby='Launch date'))
+  if environment:
+    print('\tenvironment = %s' % environment)
+  if purpose:
+    print('\tpurpose = %s' % purpose)
+  if user:
+    print('\tuser = %s' % user)
+  elif raw_output:
+    for instance in instances:
+      print(utils.generate_host(instance))
+  else:
+    # print(utils.create_instance_details_table(instances).get_string(sortby='Launch date'))
+    if fname:
+      utils.create_instance_detail_file(instances, fname)
 
   return instances
 
-def print_pricing_per_instance_type():
+def print_pricing_per_instance_type(start, end):
   token = None
   results = []
   while True:
@@ -110,7 +109,7 @@ def print_pricing_per_instance_type():
       kwargs = {'NextPageToken': token}
     else:
       kwargs = {}
-    data = boto3.client(boto3.connect_ec2).get_cost_and_usage(TimePeriod={'Start': start, 'End':  end}, Granularity='WEEKLY', Metrics=['UnblendedCost'], GroupBy=[{'Type': 'DIMENSION', 'Key': 'LINKED_ACCOUNT'}, {'Type': 'DIMENSION', 'Key': 'INSTANCE_TYPE'}], **kwargs)
+    data = boto3.client('ce').get_cost_and_usage(TimePeriod={'Start': start, 'End':  end}, Granularity='WEEKLY', Metrics=['UnblendedCost'], GroupBy=[{'Type': 'DIMENSION', 'Key': 'LINKED_ACCOUNT'}, {'Type': 'DIMENSION', 'Key': 'INSTANCE_TYPE'}], **kwargs)
     results += data['ResultsByTime']
     token = data.get('NextPageToken')
     if not token:
@@ -122,3 +121,16 @@ def print_pricing_per_instance_type():
       amount = group['Metrics']['UnblendedCost']['Amount']
       unit = group['Metrics']['UnblendedCost']['Unit']
       print(result_by_time['TimePeriod']['Start'], '\t', '\t'.join(group['Keys']), '\t', amount, '\t', unit, '\t', result_by_time['Estimated'])
+
+
+parser = argparse.ArgumentParser()
+# parser.add_argument('--days', type=int, default=30)
+parser.add_argument('--output_file', type=str, default=None)
+parser.add_argument('--env', type=str, default="staging")
+args = parser.parse_args()
+instance_query(environment=args.env, fname=args.output_file)
+
+# now = datetime.datetime.utcnow()
+# start = (now - datetime.timedelta(days=args.days)).strftime('%Y-%m-%d')
+# end = now.strftime('%Y-%m-%d')
+
